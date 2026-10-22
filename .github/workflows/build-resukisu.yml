@@ -1,0 +1,727 @@
+name: Build Valeryn + ReSukiSU terbaru
+
+# Taruh file ini di: .github/workflows/build-resukisu.yml
+# (di BRANCH DEFAULT repo fork kamu, supaya tombol "Run workflow" muncul)
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_repo:
+        description: "Opsional: repo source kernel lain, format owner/nama (kosong = repo ini). Contoh: kidzz1965/valeryn_xiaomi_sm6115"
+        default: ""
+      kernel_version:
+        description: "Opsional: cari otomatis commit kernel dengan versi ini, contoh: cip127-st11 (butuh kernel_repo bila bukan repo ini)"
+        default: ""
+      kernel_ref:
+        description: "Opsional: commit/branch/tag SOURCE KERNEL (jika kernel_version diisi, ini dipakai sebagai BRANCH tempat mencari). Kosong = ujung branch yang dijalankan"
+        default: ""
+      device:
+        description: "Codename device"
+        default: "lime"
+      defconfig:
+        description: "Defconfig DASAR, mis. vendor/xxx_defconfig (kosongkan = auto-detect)"
+        default: ""
+      fragments:
+        description: "Fragment tambahan dipisah spasi, mis. vendor/lime.config (opsional)"
+        default: ""
+      ksu_ref:
+        description: "Branch/tag/commit ReSukiSU (main = terbaru; v4.1.0 = tag stabil; 9cca1f09 = commit zip lama)"
+        default: "main"
+      update_ksu:
+        description: "Tarik ReSukiSU terbaru dan ganti KSU di source"
+        type: boolean
+        default: true
+      apply_hooks:
+        description: "Pasang manual hook ReSukiSU otomatis (aman, dilewati kalau sudah ada)"
+        type: boolean
+        default: true
+      clang_url:
+        description: "Opsional: URL arsip toolchain clang .tar.gz/.tar.xz/.tar.zst (kosong = clang bawaan Ubuntu)"
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      DEVICE: ${{ inputs.device }}
+      INPUT_DEFCONFIG: ${{ inputs.defconfig }}
+      INPUT_FRAGMENTS: ${{ inputs.fragments }}
+      KSU_REF: ${{ inputs.ksu_ref }}
+      CLANG_URL: ${{ inputs.clang_url }}
+    steps:
+      - name: Cari commit sesuai kernel_version
+        id: resolve
+        if: ${{ inputs.kernel_version != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KV: ${{ inputs.kernel_version }}
+          REPO: ${{ inputs.kernel_repo != '' && inputs.kernel_repo || github.repository }}
+          BRANCH: ${{ inputs.kernel_ref }}
+        run: |
+          set -euo pipefail
+          CIP="$(echo "$KV" | sed -nE 's/.*cip([0-9]+).*/\1/p')"
+          ST="$(echo "$KV" | sed -nE 's/.*st([0-9]+).*/\1/p')"
+          if [ -z "$CIP" ] || [ -z "$ST" ]; then
+            echo "::error::Format kernel_version harus seperti 'cip127-st11' (diterima: '$KV')"; exit 1
+          fi
+          echo "Mencari di $REPO commit dengan -cip$CIP dan -st$ST ${BRANCH:+(branch/ref: $BRANCH)}"
+
+          raw() { gh api -H 'Accept: application/vnd.github.raw+json' "$1" 2>/dev/null | tr -d '[:space:]' || true; }
+          SHAQ=""; [ -n "$BRANCH" ] && SHAQ="&sha=$BRANCH"
+
+          # 1. daftar commit yang mengubah localversion-st (terbaru dulu), maksimal 300
+          : > /tmp/st_commits.txt
+          for page in 1 2 3; do
+            gh api "repos/$REPO/commits?path=localversion-st&per_page=100&page=$page$SHAQ" \
+              --jq '.[] | "\(.sha) \(.commit.committer.date)"' >> /tmp/st_commits.txt || break
+          done
+          if [ ! -s /tmp/st_commits.txt ]; then
+            echo "::error::Tidak ada riwayat localversion-st di $REPO (repo/branch salah, atau file itu tidak ada)."; exit 1
+          fi
+
+          # 2. cari commit yang mengubah nilainya menjadi -st<ST>; yang tepat sebelumnya = bump lebih baru
+          echo "Commit yang mengubah localversion-st (terbaru dulu):"
+          NEWER=""; BUMP=""
+          while read -r SHA DATE; do
+            VAL="$(raw "repos/$REPO/contents/localversion-st?ref=$SHA")"
+            echo "  ${SHA:0:10}  ${DATE%T*}  -> $VAL"
+            if [[ "$VAL" =~ (^|[^0-9])st${ST}$ ]]; then BUMP="$SHA"; break; fi
+            NEWER="$SHA"
+          done < /tmp/st_commits.txt
+          if [ -z "$BUMP" ]; then
+            echo "::error::Tidak ada commit dengan localversion-st = st$ST di riwayat 300 commit terakhir (lihat daftar di atas)."; exit 1
+          fi
+
+          # 3. kandidat: commit tepat sebelum bump berikutnya (masih st<ST>), lalu commit bump itu sendiri
+          CANDS=""
+          if [ -n "$NEWER" ]; then
+            CANDS="$(gh api "repos/$REPO/commits/$NEWER" --jq '.parents[0].sha')"
+          else
+            CANDS="$(gh api "repos/$REPO/commits?per_page=1$SHAQ" --jq '.[0].sha')"
+          fi
+          CANDS="$CANDS $BUMP"
+
+          CHOSEN=""
+          for C in $CANDS; do
+            SV="$(raw "repos/$REPO/contents/localversion-st?ref=$C")"
+            CV="$(raw "repos/$REPO/contents/localversion-cip?ref=$C")"
+            echo "Cek ${C:0:10}: localversion-st=$SV localversion-cip=$CV"
+            if [[ "$SV" =~ (^|[^0-9])st${ST}$ ]] && [[ "$CV" =~ cip${CIP}$ ]]; then CHOSEN="$C"; break; fi
+          done
+          if [ -z "$CHOSEN" ]; then
+            echo "::error::Ditemukan st$ST tetapi cip-nya bukan cip$CIP di commit kandidat. Periksa localversion-cip di repo itu."; exit 1
+          fi
+          echo "Commit terpilih: $CHOSEN"
+          echo "sha=$CHOSEN" >> "$GITHUB_OUTPUT"
+          { echo "### Source kernel"; echo "- Repo: \`$REPO\`"; echo "- Commit: \`$CHOSEN\` (cip$CIP, st$ST)"; } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.kernel_repo }}
+          ref: ${{ steps.resolve.outputs.sha || inputs.kernel_ref }}
+          fetch-depth: 1
+
+      - name: Ambil ak3-extra dari repo/branch workflow (saat source kernel dari tempat lain)
+        if: ${{ inputs.kernel_ref != '' || inputs.kernel_repo != '' || inputs.kernel_version != '' }}
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: _wf
+          sparse-checkout: ak3-extra
+          fetch-depth: 1
+
+      - name: Info source kernel (cek hash benar sebelum build panjang)
+        run: |
+          echo "Commit yang di-checkout:"
+          git log -1 --format='  %H%n  tanggal: %ad%n  pesan  : %s' --date=iso
+          echo "File localversion (jika ada):"
+          for f in localversion*; do [ -f "$f" ] && echo "  $f: $(cat "$f")"; done
+          echo "CONFIG_LOCALVERSION di defconfig/fragment:"
+          grep -rn "CONFIG_LOCALVERSION" arch/arm64/configs/vendor/bengal-perf_defconfig arch/arm64/configs/vendor/xiaomi/ 2>/dev/null | sed 's/^/  /' || true
+          echo "Versi dasar di Makefile:"
+          sed -n '1,5p' Makefile | sed 's/^/  /'
+          echo ">>> Kalau yang tampil BUKAN cip127 / st11, batalkan run ini (Cancel workflow) dan ganti kernel_ref."
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex libssl-dev libelf-dev cpio zip unzip git curl xz-utils \
+            python3 device-tree-compiler binutils \
+            clang lld llvm \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
+
+      - name: Toolchain kustom (opsional)
+        if: ${{ inputs.clang_url != '' }}
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y --no-install-recommends zstd
+          mkdir -p "$HOME/clang" /tmp/dl
+          curl -fL --retry 3 -o /tmp/dl/clang.tar "$CLANG_URL"
+          # tar mendeteksi otomatis format gz / xz / zst dari isi file
+          tar -xf /tmp/dl/clang.tar -C "$HOME/clang"
+          CLANG_PATH="$(find "$HOME/clang" \( -type f -o -type l \) -name clang -path '*/bin/*' | head -1)"
+          if [ -z "$CLANG_PATH" ]; then
+            echo "::error::Binary clang tidak ditemukan di arsip toolchain. Isi arsip:"
+            find "$HOME/clang" -maxdepth 3 | head -40
+            exit 1
+          fi
+          CLANG_BIN="$(dirname "$CLANG_PATH")"
+          echo "Pakai clang di: $CLANG_BIN"
+          "$CLANG_BIN/clang" --version | head -1
+          echo "$CLANG_BIN" >> "$GITHUB_PATH"
+
+      - name: Update ReSukiSU ke versi terbaru
+        if: ${{ inputs.update_ksu }}
+        run: |
+          set -euo pipefail
+          rm -rf KernelSU
+          if [ -e drivers/kernelsu ]; then
+            echo "Menghapus KSU lama di drivers/kernelsu"
+            rm -rf drivers/kernelsu
+          fi
+
+          # clone FULL (tanpa --depth): versi KSU dihitung dari jumlah commit git
+          git clone https://github.com/ReSukiSU/ReSukiSU KernelSU
+          git -C KernelSU checkout "$KSU_REF"
+          echo "ReSukiSU commit: $(git -C KernelSU rev-parse --short HEAD)"
+
+          ln -sfn ../KernelSU/kernel drivers/kernelsu
+
+          grep -q 'kernelsu' drivers/Makefile \
+            || echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
+
+          if ! grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig; then
+            if [ "$(tail -n1 drivers/Kconfig)" = "endmenu" ]; then
+              sed -i '$i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
+            else
+              echo "::error::Baris terakhir drivers/Kconfig bukan 'endmenu', tambahkan source Kconfig KSU manual"
+              exit 1
+            fi
+          fi
+
+      - name: Pasang manual hook ReSukiSU (kernel 4.19)
+        if: ${{ inputs.apply_hooks }}
+        run: |
+          set -euo pipefail
+          cat > /tmp/apply_ksu_hooks.py <<'PYEOF'
+          #!/usr/bin/env python3
+          """Pasang ReSukiSU manual hook untuk kernel 4.19 (sesuai resukisu.org/guide/manual-integrate).
+          Idempotent: file yang sudah punya hook dilewati. Gagal keras kalau pola kode tidak cocok."""
+          import re
+          import sys
+          from pathlib import Path
+
+          fails = []
+          done = []
+
+
+          def rd(p):
+              return Path(p).read_text()
+
+
+          def wr(p, s):
+              Path(p).write_text(s)
+
+
+          def insert_in_func(s, func_pat, anchor_pat, text, label):
+              m = re.search(func_pat, s, re.M)
+              if not m:
+                  fails.append(f"{label}: fungsi tidak ketemu")
+                  return s
+              a = re.compile(anchor_pat, re.M).search(s, m.end())
+              if not a or a.start() - m.end() > 2500:
+                  fails.append(f"{label}: titik sisip tidak ketemu")
+                  return s
+              return s[:a.start()] + text + s[a.start():]
+
+
+          def insert_after_includes(s, block, label):
+              lines = s.split("\n")
+              last = None
+              for i, ln in enumerate(lines[:140]):
+                  if ln.startswith("#include"):
+                      last = i
+              if last is None:
+                  fails.append(f"{label}: #include tidak ketemu")
+                  return s
+              lines.insert(last + 1, "\n" + block.rstrip("\n"))
+              return "\n".join(lines)
+
+
+          # ---------------------------------------------------------------- fs/stat.c
+          def hook_stat():
+              p = "fs/stat.c"
+              s = rd(p)
+              if "ksu_handle_stat" in s:
+                  done.append(p + " (sudah ada)")
+                  return
+              n0 = len(fails)
+              decl = '''#ifdef CONFIG_KSU_MANUAL_HOOK
+          __attribute__((hot))
+          extern int ksu_handle_stat(int *dfd, const char __user **filename_user,
+          				int *flags);
+
+          extern void ksu_handle_newfstat_ret(unsigned int *fd, struct stat __user **statbuf_ptr);
+          #if defined(__ARCH_WANT_STAT64) || defined(__ARCH_WANT_COMPAT_STAT64)
+          extern void ksu_handle_fstat64_ret(unsigned long *fd, struct stat64 __user **statbuf_ptr);
+          #endif
+          #endif
+          '''
+              s = insert_after_includes(s, decl, p)
+              call = '''#ifdef CONFIG_KSU_MANUAL_HOOK
+          	ksu_handle_stat(&dfd, &filename, &flag);
+          #endif
+          '''
+              s = insert_in_func(s, r"^SYSCALL_DEFINE4\(newfstatat,",
+                                 r"^\terror = vfs_fstatat\(dfd, filename, &stat, flag\);\n", call, p + " newfstatat")
+              ret1 = '''#ifdef CONFIG_KSU_MANUAL_HOOK
+          	ksu_handle_newfstat_ret(&fd, &statbuf);
+          #endif
+          '''
+              s = insert_in_func(s, r"^SYSCALL_DEFINE2\(newfstat,", r"^\treturn error;\n", ret1, p + " newfstat")
+              # bagian 32-bit (opsional): hanya dipasang kalau fungsinya ada
+              if re.search(r"^SYSCALL_DEFINE4\(fstatat64,", s, re.M):
+                  call32 = call.replace("#ifdef CONFIG_KSU_MANUAL_HOOK\n", "#ifdef CONFIG_KSU_MANUAL_HOOK // 32-bit su\n")
+                  s = insert_in_func(s, r"^SYSCALL_DEFINE4\(fstatat64,",
+                                     r"^\terror = vfs_fstatat\(dfd, filename, &stat, flag\);\n", call32, p + " fstatat64")
+              if re.search(r"^SYSCALL_DEFINE2\(fstat64,", s, re.M):
+                  ret2 = '''#ifdef CONFIG_KSU_MANUAL_HOOK // 32-bit
+          	ksu_handle_fstat64_ret(&fd, &statbuf);
+          #endif
+          '''
+                  s = insert_in_func(s, r"^SYSCALL_DEFINE2\(fstat64,", r"^\treturn error;\n", ret2, p + " fstat64")
+              if len(fails) == n0:
+                  wr(p, s)
+                  done.append(p)
+
+
+          # ---------------------------------------------------------------- fs/exec.c
+          def hook_exec():
+              p = "fs/exec.c"
+              s = rd(p)
+              if "ksu_handle_execveat" in s:
+                  done.append(p + " (sudah ada)")
+                  return
+              pat = re.compile(
+                  r"(static int do_execveat_common\(int fd, struct filename \*filename,\s*"
+                  r"struct user_arg_ptr argv,\s*struct user_arg_ptr envp,\s*int flags\)\n)"
+                  r"\{\n\treturn __do_execve_file\(fd, filename, argv, envp, flags, NULL\);\n\}", re.M)
+              m = pat.search(s)
+              if not m:
+                  fails.append(p + ": do_execveat_common (bentuk 4.19 dengan __do_execve_file) tidak cocok")
+                  return
+              decl = '''#ifdef CONFIG_KSU_MANUAL_HOOK
+          __attribute__((hot))
+          extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr,
+          				void *argv, void *envp, int *flags);
+          __attribute__((hot))
+          extern int ksu_handle_post_execveat(int *fd, struct filename **filename_ptr,
+          				void *argv, void *envp, int *flags, int *retval);
+          #endif
+
+          '''
+              body = '''{
+          #ifdef CONFIG_KSU_MANUAL_HOOK
+          	int retval;
+          	ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);
+
+          	retval = __do_execve_file(fd, filename, argv, envp, flags, NULL);
+
+          	ksu_handle_post_execveat(&fd, &filename, &argv, &envp, &flags, &retval);
+
+          	return retval;
+          #else
+          	return __do_execve_file(fd, filename, argv, envp, flags, NULL);
+          #endif
+          }'''
+              s = s[:m.start()] + decl + m.group(1) + body + s[m.end():]
+              wr(p, s)
+              done.append(p)
+
+
+          # ---------------------------------------------------------------- fs/open.c
+          def hook_open():
+              p = "fs/open.c"
+              s = rd(p)
+              if "ksu_handle_faccessat" in s:
+                  done.append(p + " (sudah ada)")
+                  return
+              decl = '''#ifdef CONFIG_KSU_MANUAL_HOOK
+          __attribute__((hot))
+          extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user,
+          				int *mode, int *flags);
+          #endif
+
+          '''
+              new = re.compile(
+                  r"(SYSCALL_DEFINE3\(faccessat, int, dfd, const char __user \*, filename, int, mode\)\n)"
+                  r"\{\n\treturn do_faccessat\(dfd, filename, mode\);\n\}", re.M)
+              m = new.search(s)
+              if m:  # bentuk 4.19+
+                  body = '''{
+          #ifdef CONFIG_KSU_MANUAL_HOOK
+          	ksu_handle_faccessat(&dfd, &filename, &mode, NULL);
+          #endif
+          	return do_faccessat(dfd, filename, mode);
+          }'''
+                  s = s[:m.start()] + decl + m.group(1) + body + s[m.end():]
+                  wr(p, s)
+                  done.append(p)
+                  return
+              m = re.search(r"^SYSCALL_DEFINE3\(faccessat, int, dfd, const char __user \*, filename, int, mode\)\n", s, re.M)
+              if not m:
+                  fails.append(p + ": faccessat tidak ketemu")
+                  return
+              n0 = len(fails)
+              call = '''#ifdef CONFIG_KSU_MANUAL_HOOK
+          	ksu_handle_faccessat(&dfd, &filename, &mode, NULL);
+          #endif
+
+          '''
+              s = insert_in_func(s, r"^SYSCALL_DEFINE3\(faccessat,", r"^\tif \(mode & ~S_IRWXO\)", call, p)
+              if len(fails) == n0:
+                  i = s.index("SYSCALL_DEFINE3(faccessat,")
+                  s = s[:i] + decl + s[i:]
+                  wr(p, s)
+                  done.append(p + " (bentuk lama)")
+
+
+          # ---------------------------------------------------------------- kernel/reboot.c
+          def hook_reboot():
+              p = "kernel/reboot.c"
+              if not Path(p).exists():
+                  fails.append(p + ": file tidak ada (kernel < 3.11? hook di kernel/sys.c)")
+                  return
+              s = rd(p)
+              if "ksu_handle_sys_reboot" in s:
+                  done.append(p + " (sudah ada)")
+                  return
+              n0 = len(fails)
+              call = '''#ifdef CONFIG_KSU_MANUAL_HOOK
+          	ksu_handle_sys_reboot(magic1, magic2, cmd, &arg);
+          #endif
+          '''
+              s = insert_in_func(s, r"^SYSCALL_DEFINE4\(reboot, int, magic1,",
+                                 r"^\t/\* We only trust the superuser with rebooting the system\. \*/", call, p)
+              decl = '''#ifdef CONFIG_KSU_MANUAL_HOOK
+          extern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user **arg);
+          #endif
+
+          '''
+              i = s.find("SYSCALL_DEFINE4(reboot, int, magic1,")
+              if i < 0:
+                  fails.append(p + ": SYSCALL_DEFINE4(reboot) tidak ketemu")
+              elif len(fails) == n0:
+                  s = s[:i] + decl + s[i:]
+                  wr(p, s)
+                  done.append(p)
+
+
+          # ---------------------------------------------------------------- export static (selinux)
+          soft = []
+
+
+          def unstatic(path, name, label):
+              """Hapus 'static' dari definisi simbol `name` (toleran terhadap const, spasi, dll).
+              Kalau gagal: tidak fatal, build memakai CONFIG_KALLSYMS_ALL sebagai gantinya."""
+              s = rd(path)
+              if re.search(r"^(?!static\b)[^\n#]*\b" + re.escape(name) + r"\b[^\n;]*(=|\{)", s, re.M) and \
+                      not re.search(r"^static\s[^\n]*\b" + re.escape(name) + r"\b", s, re.M):
+                  done.append(f"{path}: {label} (sudah non-static)")
+                  return
+              s2, n = re.subn(r"^static\s+(?=[^\n]*\b" + re.escape(name) + r"\b)", "", s, count=1, flags=re.M)
+              if n == 0:
+                  soft.append(f"{path}: {label} tidak ketemu")
+                  print(f"-- diagnostik: baris yang memuat '{name}' di {path}:")
+                  hits = [f"   {i}: {ln}" for i, ln in enumerate(s.split("\n"), 1) if name in ln]
+                  print("\n".join(hits[:8]) if hits else "   (tidak ada sama sekali)")
+                  return
+              wr(path, s2)
+              done.append(f"{path}: {label}")
+
+
+          if __name__ == "__main__":
+              print("apply_ksu_hooks v3")
+              hook_stat()
+              hook_exec()
+              hook_open()
+              hook_reboot()
+              unstatic("security/selinux/selinuxfs.c", "write_op", "write_op")
+              unstatic("security/selinux/selinuxfs.c", "sel_handle_status_ops", "sel_handle_status_ops")
+
+              if soft:
+                  for f in soft:
+                      print(f"::warning::{f} -> memakai CONFIG_KALLSYMS_ALL sebagai gantinya")
+                  Path("/tmp/ksu_need_kallsyms_all").write_text("1\n")
+
+              print("== Hook terpasang ==")
+              for d in done:
+                  print("  OK  ", d)
+              if fails:
+                  print("== GAGAL ==")
+                  for f in fails:
+                      print("  GAGAL", f)
+                      print(f"::error::{f}")
+                  sys.exit(1)
+          PYEOF
+          python3 /tmp/apply_ksu_hooks.py
+
+      - name: Cek manual hook di source
+        run: |
+          echo "Jumlah referensi 'ksu_' per file hook:"
+          MISSING=0
+          for f in fs/stat.c fs/exec.c fs/open.c kernel/reboot.c; do
+            n="$(grep -c 'ksu_' "$f" 2>/dev/null || true)"
+            printf '  %-20s %s\n' "$f" "${n:-0}"
+            [ "${n:-0}" = "0" ] && MISSING=$((MISSING+1))
+          done
+          if [ "$MISSING" -gt 0 ]; then
+            echo "::error::Ada $MISSING file hook wajib yang belum punya hook KSU. ReSukiSU akan gagal compile. Aktifkan input 'apply_hooks' atau pasang manual."
+            exit 1
+          fi
+
+      - name: Tentukan defconfig
+        run: |
+          set -euo pipefail
+          CFG=arch/arm64/configs
+          echo "Source: $(git log -1 --format='%h %ad %s' --date=short)"
+          echo "== Isi $CFG (level atas) =="
+          ls "$CFG" | head -50
+          echo "== File config yang relevan di $CFG =="
+          find "$CFG" -type f \( -iname "*${DEVICE}*" -o -iname "*bengal*" -o -iname "*sm6115*" -o -iname "*trinket*" -o -iname "*scuba*" -o -iname "*.config" \) | sed "s|^$CFG/||" | sort
+          echo "== Semua *defconfig (50 pertama) =="
+          find "$CFG" -type f -name '*defconfig*' | sed "s|^$CFG/||" | sort | head -50
+
+          DEFCONFIG="$INPUT_DEFCONFIG"
+          FRAGMENTS="$INPUT_FRAGMENTS"
+
+          if [ -z "$DEFCONFIG" ]; then
+            DEFCONFIG="$(find "$CFG" -type f -name "*${DEVICE}*defconfig*" | sed "s|^$CFG/||" | sort | head -1)"
+          fi
+          if [ -z "$DEFCONFIG" ]; then
+            ALL="$(find "$CFG" -type f -name '*defconfig*' | sed "s|^$CFG/||" | sort)"
+            if [ "$(printf '%s\n' "$ALL" | grep -c .)" -eq 1 ]; then
+              DEFCONFIG="$ALL"
+              echo "::notice::Hanya ada satu defconfig di source ini ($DEFCONFIG), dipakai otomatis."
+            fi
+          fi
+
+          case "$DEFCONFIG" in
+            *.config)
+              echo "::error::'$DEFCONFIG' itu FRAGMENT (potongan config), bukan defconfig dasar. Isi input 'defconfig' dengan defconfig dasar dan taruh '$DEFCONFIG' di input 'fragments'. Lihat daftar file di atas."
+              exit 1 ;;
+          esac
+
+          if [ -z "$DEFCONFIG" ]; then
+            echo "::error::Defconfig dasar tidak ketemu otomatis. Lihat daftar di atas, lalu isi input 'defconfig' (dan 'fragments' kalau perlu)."
+            exit 1
+          fi
+          if [ ! -f "$CFG/$DEFCONFIG" ]; then
+            echo "::error::Defconfig '$DEFCONFIG' tidak ada di source ini. Yang tersedia ada di daftar di atas. Kalau hanya ada 'defconfig', isi input defconfig = defconfig dan kosongkan 'fragments'."
+            exit 1
+          fi
+          for f in $FRAGMENTS; do
+            [ -f "$CFG/$f" ] || { echo "::error::Fragment '$f' tidak ada di source ini. Kosongkan input 'fragments' kalau source ini tidak punya fragment per-device."; exit 1; }
+          done
+
+          echo "Defconfig dasar: $DEFCONFIG"
+          echo "Fragments      : ${FRAGMENTS:-(tidak ada)}"
+          echo "DEFCONFIG=$DEFCONFIG" >> "$GITHUB_ENV"
+          echo "FRAGMENTS=$FRAGMENTS" >> "$GITHUB_ENV"
+
+      - name: Build kernel
+        run: |
+          set -eo pipefail
+          clang --version | head -1
+          MAKE_ARGS=(
+            O=out ARCH=arm64 SUBARCH=arm64
+            CC=clang LD=ld.lld AR=llvm-ar NM=llvm-nm
+            OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip
+            LLVM_IAS=1
+            CROSS_COMPILE=aarch64-linux-gnu-
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+            CLANG_TRIPLE=aarch64-linux-gnu-
+            KCFLAGS=-Wno-error
+          )
+
+          make "${MAKE_ARGS[@]}" "$DEFCONFIG"
+
+          # Gabungkan fragment (jika ada)
+          for f in $FRAGMENTS; do
+            echo "Merge fragment: $f"
+            scripts/kconfig/merge_config.sh -m -O out out/.config "arch/arm64/configs/$f"
+          done
+          [ -n "$FRAGMENTS" ] && make "${MAKE_ARGS[@]}" olddefconfig
+
+          # Aktifkan KSU + manual hook. Hook setuid / sys_read / input dipasang
+          # otomatis lewat LSM untuk kernel < 6.8 (tidak perlu patch manual).
+          EXTRA_CFG=()
+          if [ -f /tmp/ksu_need_kallsyms_all ]; then
+            echo "Export static selinux tidak bisa dipatch -> pakai CONFIG_KALLSYMS_ALL sebagai gantinya"
+            EXTRA_CFG=(-e KALLSYMS -e KALLSYMS_ALL)
+          fi
+          scripts/config --file out/.config \
+            -e KSU -e KSU_MANUAL_HOOK \
+            -e KSU_MANUAL_HOOK_AUTO_SETUID_HOOK \
+            -e KSU_MANUAL_HOOK_AUTO_INITRC_HOOK \
+            -e KSU_MANUAL_HOOK_AUTO_INPUT_HOOK \
+            "${EXTRA_CFG[@]}"
+          make "${MAKE_ARGS[@]}" olddefconfig
+          echo "Config KSU yang aktif:"
+          grep -E '^CONFIG_KSU' out/.config || true
+          for o in KSU_MANUAL_HOOK_AUTO_SETUID_HOOK KSU_MANUAL_HOOK_AUTO_INITRC_HOOK KSU_MANUAL_HOOK_AUTO_INPUT_HOOK; do
+            grep -q "^CONFIG_$o=y" out/.config || \
+              echo "::warning::CONFIG_$o tidak aktif (kemungkinan tidak ada di versi ReSukiSU ini). Hook terkait tidak terpasang otomatis, root bisa tidak lengkap."
+          done
+          if ! grep -q '^CONFIG_KSU_MANUAL_HOOK=y' out/.config; then
+            echo "::error::CONFIG_KSU_MANUAL_HOOK tidak aktif setelah olddefconfig. Cek Kconfig ReSukiSU / fragment kernelsu.config."
+            exit 1
+          fi
+
+          echo "Platform di .config:"
+          grep -E '^CONFIG_ARCH_(BENGAL|SCUBA|TRINKET|KONA|LITO|MSM8937|SDM660)=|^CONFIG_LOCALVERSION=' out/.config | sed 's/^/  /' || true
+          if ! grep -q '^CONFIG_ARCH_BENGAL=y' out/.config; then
+            echo "::warning::CONFIG_ARCH_BENGAL tidak aktif. Kernel ini mungkin BUKAN untuk SM6115 (lime). Jangan di-flash sebelum dicek."
+          fi
+
+          make "${MAKE_ARGS[@]}" -j"$(nproc)" Image.gz 2>&1 | tee build.log
+
+      - name: Ringkasan error build (hanya jika gagal)
+        if: failure()
+        run: |
+          [ -f build.log ] || { echo "build.log tidak ada (kegagalan terjadi sebelum compile, lihat step yang merah)"; exit 0; }
+          echo "== Baris error (error: / undefined reference / *** ) - 20 pertama =="
+          grep -nE "error:|undefined reference|fatal error|\*\*\*" build.log | head -20
+          N="$(grep -nE "error:|undefined reference|fatal error" build.log | head -1 | cut -d: -f1)"
+          if [ -n "$N" ]; then
+            echo; echo "== Konteks di sekitar error pertama (akar masalah biasanya di sini) =="
+            S=$((N>15 ? N-15 : 1)); sed -n "${S},$((N+10))p" build.log
+          fi
+
+      - name: Verifikasi KSU ikut ter-compile
+        run: |
+          set +e
+          IMG=out/arch/arm64/boot/Image
+          strings -n 6 "$IMG" > /tmp/img_strings.txt
+
+          OBJ="$(find out/drivers/kernelsu -name '*.o' 2>/dev/null | wc -l)"
+          NCOMP="$(grep -c 'drivers/kernelsu' build.log)"
+          NSTR="$(grep -c 'KernelSU' /tmp/img_strings.txt)"
+          VER="$(grep -m1 -E 'v[0-9]+\.[0-9]+\.[0-9]+[-0-9A-Za-z.]*-[0-9a-f]{7,8}(@[A-Za-z0-9._/-]+)?' /tmp/img_strings.txt)"
+          KSU_COMMIT="$(git -C KernelSU log -1 --format='%h %s' 2>/dev/null)"
+
+          echo "1. File objek KSU di out/drivers/kernelsu : $OBJ"
+          echo "2. Baris compile KSU di build.log         : $NCOMP"
+          echo "3. String 'KernelSU' di dalam Image       : $NSTR"
+          echo "4. String versi di Image                  : ${VER:-(tidak terdeteksi)}"
+          echo "5. Commit ReSukiSU yang di-clone          : ${KSU_COMMIT:-(tidak ada)}"
+          echo "   Versi kernel (kernel.release)         : $(cat out/include/config/kernel.release 2>/dev/null)"
+          echo "   Commit source kernel                  : $(git log -1 --format='%h %ad %s' --date=short 2>/dev/null)"
+          echo "6. Config KSU:"
+          grep -E '^CONFIG_KSU' out/.config | sed 's/^/     /'
+
+          {
+            echo "### Verifikasi KSU"
+            echo "- Objek KSU ter-compile: \`$OBJ\` file"
+            echo "- String KernelSU di Image: \`$NSTR\`"
+            echo "- Versi di Image: \`${VER:-tidak terdeteksi}\`"
+            echo "- Commit ReSukiSU: \`${KSU_COMMIT:-tidak ada}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "${NSTR:-0}" -eq 0 ] && [ "${OBJ:-0}" -eq 0 ]; then
+            echo "::error::KSU tidak ikut ter-compile (tidak ada objek dan tidak ada string di Image). Zip tidak dibuat."
+            exit 1
+          fi
+          if [ -z "$VER" ]; then
+            echo "::notice::String versi tidak terdeteksi, tapi KSU terbukti ter-compile (poin 1-3). Cek versi lewat aplikasi manager."
+          fi
+
+      - name: Package AnyKernel3
+        run: |
+          set -euo pipefail
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3 AnyKernel3
+          rm -rf AnyKernel3/.git AnyKernel3/.github AnyKernel3/README.md
+
+          cat > AnyKernel3/anykernel.sh <<'EOF'
+          ### AnyKernel3 Ramdisk Mod Script
+          ## osm0sis @ xda-developers
+
+          ### AnyKernel setup
+          # global properties
+          properties() { '
+          kernel.string=Imperial Valeryn + ReSukiSU (custom build)
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=1
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=DEVICE_PLACEHOLDER
+          supported.versions=
+          supported.patchlevels=
+          supported.vendorpatchlevels=
+          '; } # end properties
+
+
+          ### AnyKernel install
+          ## boot files attributes
+          boot_attributes() {
+          set_perm_recursive 0 0 755 644 $RAMDISK/*;
+          set_perm_recursive 0 0 750 750 $RAMDISK/init* $RAMDISK/sbin;
+          } # end attributes
+
+          # boot shell variables
+          BLOCK=/dev/block/bootdevice/by-name/boot;
+          IS_SLOT_DEVICE=0;
+          RAMDISK_COMPRESSION=auto;
+          PATCH_VBMETA_FLAG=auto;
+
+          # import functions/variables and setup patching - see for reference (DO NOT REMOVE)
+          . tools/ak3-core.sh;
+
+          # boot install
+          dump_boot; # use split_boot to skip ramdisk unpack, e.g. for devices with init_boot ramdisk
+
+          write_boot; # use flash_boot to skip ramdisk repack, e.g. for devices with init_boot ramdisk
+          ## end boot install
+          EOF
+          sed -i "s/DEVICE_PLACEHOLDER/${DEVICE}/" AnyKernel3/anykernel.sh
+
+          cp out/arch/arm64/boot/Image.gz AnyKernel3/Image.gz
+
+          # Opsional: taruh file 'dtb' dan 'dtbo.img' dari zip lama kamu di folder ak3-extra/
+          EXTRA_DIR=""
+          if [ -d _wf/ak3-extra ]; then EXTRA_DIR="_wf/ak3-extra"
+          elif [ -d ak3-extra ]; then EXTRA_DIR="ak3-extra"; fi
+          if [ -n "$EXTRA_DIR" ]; then
+            echo "Menyalin isi $EXTRA_DIR/ ke zip"
+            cp -r "$EXTRA_DIR"/. AnyKernel3/
+          fi
+
+          KSU_SHORT="$(git -C KernelSU rev-parse --short HEAD 2>/dev/null || echo unknown)"
+          KERN_SHORT="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
+          ZIP="Valeryn-${DEVICE}-ReSukiSU-${KSU_SHORT}-k${KERN_SHORT}-$(date +%Y%m%d).zip"
+          ( cd AnyKernel3 && zip -r9 "../$ZIP" . -x '.git*' )
+          echo "ZIP_NAME=$ZIP" >> "$GITHUB_ENV"
+          ls -lh "$ZIP"
+
+      - name: Upload hasil
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ZIP_NAME }}
+          path: ${{ env.ZIP_NAME }}
+          retention-days: 14
+
+      - name: Upload log build
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
+          retention-days: 7
