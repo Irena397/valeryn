@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       kernel_repo:
-        description: "Opsional: repo source kernel lain, format owner/nama (kosong = repo ini). Contoh: kidzz1965/valeryn_xiaomi_sm6115"
+        description: "Opsional: repo source kernel lain, format owner/nama atau URL GitHub (kosong = repo ini). Contoh: anggitmrt87/valeryn_xiaomi_sm6115"
         default: ""
       kernel_version:
         description: "Opsional: cari otomatis commit kernel dengan versi ini, contoh: cip127-st11 (butuh kernel_repo bila bukan repo ini)"
@@ -53,14 +53,40 @@ jobs:
       KSU_REF: ${{ inputs.ksu_ref }}
       CLANG_URL: ${{ inputs.clang_url }}
     steps:
+      - name: Rapikan input repo (terima owner/nama maupun URL GitHub)
+        id: norm
+        env:
+          IN_REPO: ${{ inputs.kernel_repo }}
+          IN_REF: ${{ inputs.kernel_ref }}
+        run: |
+          set -euo pipefail
+          R="$IN_REPO"; REF="$IN_REF"
+          R="${R#"${R%%[![:space:]]*}"}"; R="${R%"${R##*[![:space:]]}"}"
+          if [ -n "$R" ]; then
+            R="${R#https://}"; R="${R#http://}"; R="${R#www.}"; R="${R#github.com/}"
+            # URL dengan /tree/<branch> atau /commit/<sha>: ambil sebagai ref (jika kernel_ref kosong)
+            if [[ "$R" =~ ^([^/]+/[^/]+)/(tree|commit|blob)/([^/]+) ]]; then
+              [ -z "$REF" ] && REF="${BASH_REMATCH[3]}"
+              R="${BASH_REMATCH[1]}"
+            fi
+            R="$(printf '%s' "$R" | cut -d/ -f1-2)"
+            R="${R%.git}"
+          fi
+          if [ -n "$R" ] && ! [[ "$R" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+            echo "::error::kernel_repo harus berformat owner/nama atau URL GitHub (diterima: '$IN_REPO')"; exit 1
+          fi
+          echo "repo=$R" >> "$GITHUB_OUTPUT"
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+          echo "kernel_repo: '${IN_REPO}' -> '${R:-(repo ini)}'   kernel_ref: '${REF:-(kosong)}'"
+
       - name: Cari commit sesuai kernel_version
         id: resolve
         if: ${{ inputs.kernel_version != '' }}
         env:
           GH_TOKEN: ${{ github.token }}
           KV: ${{ inputs.kernel_version }}
-          REPO: ${{ inputs.kernel_repo != '' && inputs.kernel_repo || github.repository }}
-          BRANCH: ${{ inputs.kernel_ref }}
+          REPO: ${{ steps.norm.outputs.repo != '' && steps.norm.outputs.repo || github.repository }}
+          BRANCH: ${{ steps.norm.outputs.ref }}
         run: |
           set -euo pipefail
           CIP="$(echo "$KV" | sed -nE 's/.*cip([0-9]+).*/\1/p')"
@@ -122,8 +148,8 @@ jobs:
       - name: Checkout kernel source
         uses: actions/checkout@v4
         with:
-          repository: ${{ inputs.kernel_repo }}
-          ref: ${{ steps.resolve.outputs.sha || inputs.kernel_ref }}
+          repository: ${{ steps.norm.outputs.repo }}
+          ref: ${{ steps.resolve.outputs.sha || steps.norm.outputs.ref }}
           fetch-depth: 1
 
       - name: Ambil ak3-extra dari repo/branch workflow (saat source kernel dari tempat lain)
