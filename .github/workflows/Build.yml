@@ -1,4 +1,4 @@
-name: Valeryn + ReSukiSU V2
+name: Valeryn + BakaSU V2
 
 on:
   workflow_dispatch:
@@ -219,7 +219,7 @@ jobs:
           "$CLANG_BIN/clang" --version | head -1
           echo "$CLANG_BIN" >> "$GITHUB_PATH"
 
-      - name: Update ReSukiSU ke versi terbaru
+      - name: Update BakaSU ke versi terbaru
         if: ${{ inputs.update_ksu }}
         run: |
           set -euo pipefail
@@ -248,7 +248,7 @@ jobs:
             fi
           fi
 
-      - name: Pasang manual hook ReSukiSU (kernel 4.19)
+      - name: Pasang manual hook BakaSU (kernel 4.19)
         if: ${{ inputs.apply_hooks }}
         run: |
           set -euo pipefail
