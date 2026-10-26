@@ -17,10 +17,10 @@ on:
         default: "lime"
       defconfig:
         description: ""
-        default: ""
+        default: "vendor/bengal-perf_defconfig"
       fragments:
         description: ""
-        default: ""
+        default: "vendor/xiaomi/lime.config"
       ksu_ref:
         description: ""
         default: "main"
@@ -50,7 +50,7 @@ jobs:
       KSU_REF: ${{ inputs.ksu_ref }}
       CLANG_URL: ${{ inputs.clang_url }}
     steps:
-      - name: Rapikan input repo (terima owner/nama maupun URL GitHub)
+      - name: Rapikan input repo
         id: norm
         env:
           IN_REPO: ${{ inputs.kernel_repo }}
