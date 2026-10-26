@@ -1,8 +1,5 @@
 name: Valeryn + ReSukiSU V2
 
-# Taruh file ini di: .github/workflows/build-resukisu.yml
-# (di BRANCH DEFAULT repo fork kamu, supaya tombol "Run workflow" muncul)
-
 on:
   workflow_dispatch:
     inputs:
@@ -166,7 +163,7 @@ jobs:
           { echo "### Source kernel"; echo "- Repo: \`$REPO\`"; echo "- Commit: \`$CHOSEN\` (st$ST, cip=$CV, tanggal ${CDATE%T*})"; } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Checkout kernel source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: ${{ steps.norm.outputs.repo }}
           ref: ${{ steps.resolve.outputs.sha || steps.norm.outputs.ref }}
@@ -174,7 +171,7 @@ jobs:
 
       - name: Ambil ak3-extra dari repo/branch workflow (saat source kernel dari tempat lain)
         if: ${{ inputs.kernel_ref != '' || inputs.kernel_repo != '' || inputs.kernel_version != '' }}
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           ref: ${{ github.sha }}
           path: _wf
@@ -889,7 +886,7 @@ jobs:
           ls -lh "$ZIP"
 
       - name: Upload hasil
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: ${{ env.ZIP_NAME }}
           path: ${{ env.ZIP_NAME }}
@@ -897,7 +894,7 @@ jobs:
 
       - name: Upload log build
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: build-log
           path: build.log
