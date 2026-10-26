@@ -4,37 +4,37 @@ on:
   workflow_dispatch:
     inputs:
       kernel_repo:
-        description: "Opsional: repo source kernel lain, format owner/nama atau URL GitHub (kosong = repo ini). Contoh: anggitmrt87/valeryn_xiaomi_sm6115"
+        description: ""
         default: ""
       kernel_version:
-        description: "Opsional: cari otomatis commit kernel dengan versi ini, contoh: cip127-st11 atau hanya st11 (angka st dihitung per branch, bandingkan tanggalnya di log)"
+        description: ""
         default: ""
       kernel_ref:
-        description: "Opsional: BRANCH/TAG atau hash LENGKAP (40 karakter) SOURCE KERNEL. Jangan isi commit ReSukiSU di sini (itu untuk ksu_ref). Kosong = ujung branch yang dijalankan"
+        description: ""
         default: ""
       device:
-        description: "Codename device"
+        description: ""
         default: "lime"
       defconfig:
-        description: "Defconfig DASAR, mis. vendor/xxx_defconfig (kosongkan = auto-detect)"
+        description: ""
         default: ""
       fragments:
-        description: "Fragment tambahan dipisah spasi, mis. vendor/lime.config (opsional)"
+        description: ""
         default: ""
       ksu_ref:
-        description: "Branch/tag/commit RESUKISU (bukan kernel). main = terbaru; v4.1.0 = tag stabil; 9cca1f09 = commit zip lama"
+        description: ""
         default: "main"
       update_ksu:
-        description: "Tarik ReSukiSU terbaru dan ganti KSU di source"
+        description: ""
         type: boolean
         default: true
       apply_hooks:
-        description: "Pasang manual hook ReSukiSU otomatis (aman, dilewati kalau sudah ada)"
+        description: ""
         type: boolean
         default: true
       clang_url:
-        description: "Opsional: URL arsip toolchain clang .tar.gz/.tar.xz/.tar.zst (kosong = clang bawaan Ubuntu)"
-        default: ""
+        description: ""
+        default: "https://github.com/Neebe3289/aosp-clang/releases/download/clang-23.0.1-16464736/clang-23.0.1-16464736.tar.gz"
 
 permissions:
   contents: read
