@@ -1,0 +1,104 @@
+name: SUSFS probe (cek patch susfs cocok ke source kernel, TANPA build)
+
+# Taruh di: .github/workflows/susfs-probe.yml
+# Workflow ini TIDAK membangun kernel dan TIDAK mengubah repo kamu.
+# Tugasnya cuma: ambil patch SUSFS dari GitLab, coba tempel ke source kernel
+# di runner sementara, lalu laporkan bagian mana yang cocok / gagal.
+
+on:
+  workflow_dispatch:
+    inputs:
+      susfs_ref:
+        description: "Branch/tag repo simonpunk/susfs4ksu. ReSukiSU menyarankan backport dari gki-android12-5.10"
+        default: "gki-android12-5.10"
+      kernel_ref:
+        description: "Opsional: branch/tag/hash LENGKAP source kernel (kosong = branch yang dijalankan)"
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout kernel source
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.kernel_ref }}
+          fetch-depth: 1
+
+      - name: Ambil repo SUSFS
+        env:
+          SUSFS_REF: ${{ inputs.susfs_ref }}
+        run: |
+          set -euo pipefail
+          git clone --depth=1 --branch "$SUSFS_REF" https://gitlab.com/simonpunk/susfs4ksu.git /tmp/susfs
+          echo "SUSFS commit: $(git -C /tmp/susfs log -1 --format='%h %ad %s' --date=short)"
+          echo "== isi kernel_patches =="
+          find /tmp/susfs/kernel_patches -maxdepth 2 | sed 's|/tmp/susfs/||' | sort
+
+      - name: Coba tempel patch kernel SUSFS
+        run: |
+          set +e
+          KP=/tmp/susfs/kernel_patches
+          PATCH_FILE="$(ls "$KP"/50_add_susfs_in_*.patch 2>/dev/null | head -1)"
+          if [ -z "$PATCH_FILE" ]; then
+            echo "::error::File 50_add_susfs_in_*.patch tidak ditemukan di branch ini. Lihat daftar kernel_patches di step sebelumnya."
+            exit 1
+          fi
+          echo "Patch kernel: $(basename "$PATCH_FILE")"
+
+          mkdir -p /tmp/report
+          {
+            echo "### SUSFS probe"
+            echo "- Source kernel: \`$(git log -1 --format='%h %s' )\`"
+            echo "- SUSFS: \`$(git -C /tmp/susfs log -1 --format='%h %s')\` (branch ${{ inputs.susfs_ref }})"
+            echo "- Patch: \`$(basename "$PATCH_FILE")\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # 1) file baru dari SUSFS (fs/*.c, include/linux/*.h) disalin apa adanya
+          [ -d "$KP/fs" ] && cp -rv "$KP"/fs/. fs/
+          [ -d "$KP/include/linux" ] && cp -rv "$KP"/include/linux/. include/linux/
+
+          # 2) dry-run dulu: tidak mengubah apa pun, hanya melaporkan
+          echo "== DRY-RUN =="
+          patch -p1 --dry-run --no-backup-if-mismatch < "$PATCH_FILE" | tee /tmp/report/dryrun.txt
+          FAILED="$(grep -c 'FAILED' /tmp/report/dryrun.txt)"
+          OK="$(grep -c 'succeeded' /tmp/report/dryrun.txt)"
+          echo "Hunk berhasil: $OK  | gagal: $FAILED"
+
+          # 3) tempel sungguhan (di runner sementara) supaya file .rej terbentuk
+          echo "== PATCH SUNGGUHAN (runner sementara, repo-mu tidak berubah) =="
+          patch -p1 --no-backup-if-mismatch < "$PATCH_FILE" | tee /tmp/report/patch.txt
+
+          find . -name '*.rej' -not -path './.git/*' | sort | tee /tmp/report/rej-list.txt
+          while read -r f; do
+            echo "-------- $f --------"; cat "$f"
+          done < /tmp/report/rej-list.txt > /tmp/report/rej-content.txt
+
+          {
+            echo "- Hunk berhasil: **$OK**, gagal: **$FAILED**"
+            if [ -s /tmp/report/rej-list.txt ]; then
+              echo "- File dengan hunk GAGAL (.rej):"
+              sed 's/^/  - `/; s/$/`/' /tmp/report/rej-list.txt
+            else
+              echo "- Tidak ada hunk gagal: patch tertempel bersih."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # info tambahan: tumpang tindih dengan hook manual ReSukiSU
+          echo "== File yang disentuh patch SUSFS =="
+          grep -E '^\+\+\+ ' "$PATCH_FILE" | sed 's|^+++ b/||' | tee /tmp/report/files-touched.txt
+          git diff --stat > /tmp/report/diffstat.txt 2>/dev/null || true
+          exit 0
+
+      - name: Upload laporan
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: susfs-probe-report
+          path: /tmp/report
+          if-no-files-found: ignore
+          retention-days: 7
