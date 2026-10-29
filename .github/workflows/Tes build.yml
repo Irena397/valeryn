@@ -1,0 +1,107 @@
+name: SUSFS probe 4.19 TEST
+
+on:
+  workflow_dispatch:
+    inputs:
+      patch_url:
+        description: "URL RAW file patch SUSFS 4.19 (isi default = patch zhangziren666)"
+        default: "https://raw.githubusercontent.com/zhangziren666/bakasu-kernel/main/patches/50_add_susfs_in_kernel-4.19-2.3.0.patch"
+      kernel_ref:
+        description: "Opsional: branch/tag/hash LENGKAP source kernel (kosong = branch yang dijalankan)"
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout kernel source
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.kernel_ref }}
+          fetch-depth: 1
+
+      - name: Unduh patch SUSFS
+        env:
+          PATCH_URL: ${{ inputs.patch_url }}
+        run: |
+          set -euo pipefail
+          case "$PATCH_URL" in
+            https://*) ;;
+            *) echo "::error::patch_url harus berupa URL https RAW (bukan halaman GitHub biasa): '$PATCH_URL'"; exit 1 ;;
+          esac
+          mkdir -p /tmp/report
+          curl -fL --retry 3 -o /tmp/susfs.patch "$PATCH_URL"
+          echo "Ukuran : $(wc -c < /tmp/susfs.patch) byte, $(wc -l < /tmp/susfs.patch) baris"
+          echo "SHA256 : $(sha256sum /tmp/susfs.patch | cut -d' ' -f1)"
+          head -c 300 /tmp/susfs.patch | head -5
+
+      - name: Uji tempel patch
+        run: |
+          set +e
+          P=/tmp/susfs.patch
+          {
+            echo "### SUSFS probe 4.19"
+            echo "- Source kernel: \`$(git log -1 --format='%h %s')\`"
+            echo "- Versi kernel (Makefile): \`$(sed -n '1,3p' Makefile | tr '\n' ' ')\`"
+            echo "- Patch SHA256: \`$(sha256sum $P | cut -d' ' -f1)\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "== File yang disentuh patch =="
+          grep -E '^\+\+\+ ' $P | sed 's|^+++ b/||; s|^+++ ||' | tee /tmp/report/files-touched.txt
+
+          echo "== DRY-RUN (tidak mengubah apa pun) =="
+          patch -p1 --dry-run --no-backup-if-mismatch < $P | tee /tmp/report/dryrun.txt
+          FAILED="$(grep -c 'FAILED' /tmp/report/dryrun.txt)"
+          OK="$(grep -c 'succeeded' /tmp/report/dryrun.txt)"
+          FUZZ="$(grep -c 'with fuzz' /tmp/report/dryrun.txt)"
+          echo "Hunk berhasil: $OK | gagal: $FAILED | pakai fuzz: $FUZZ"
+
+          echo "== PATCH SUNGGUHAN (runner sementara, repo-mu tidak berubah) =="
+          patch -p1 --no-backup-if-mismatch < $P | tee /tmp/report/patch.txt
+
+          find . -name '*.rej' -not -path './.git/*' | sort | tee /tmp/report/rej-list.txt
+          while read -r f; do echo "-------- $f --------"; cat "$f"; done < /tmp/report/rej-list.txt > /tmp/report/rej-content.txt
+          NREJ="$(grep -c '^@@' /tmp/report/rej-content.txt)"
+
+          # Cek 7 hook KSU yang diminta BakaSU (mode inline SUSFS)
+          echo "== Cek 7 hook KSU inline =="
+          : > /tmp/report/hooks.txt
+          for pair in "kernel/sys.c:ksu_handle_setresuid" "fs/exec.c:ksu_handle_execveat" \
+                      "fs/open.c:ksu_handle_faccessat" "fs/read_write.c:ksu_handle_sys_read" \
+                      "fs/stat.c:ksu_handle_stat" "kernel/reboot.c:ksu_handle_sys_reboot" \
+                      "drivers/input/input.c:ksu_handle_input_handle_event"; do
+            f="${pair%%:*}"; s="${pair##*:}"
+            if grep -q "$s" "$f" 2>/dev/null; then echo "ADA     $f -> $s"; else echo "KOSONG  $f -> $s"; fi
+          done | tee /tmp/report/hooks.txt
+
+          # Tanda yang patut dicek manusia: baris tambahan yang menyentuh hal sensitif
+          echo "== Baris tambahan yang patut diperiksa manual =="
+          grep -nE '^\+.*(call_usermodehelper|kernel_write|filp_open\(|commit_creds|override_creds|sock_create|kernel_connect|request_firmware|crypto_)' $P \
+            | head -40 | tee /tmp/report/review-flags.txt
+
+          {
+            echo "- Hunk berhasil: **$OK**, gagal: **$FAILED**, fuzz: **$FUZZ**"
+            echo "- Hunk ditolak (.rej): **$NREJ**"
+            if [ -s /tmp/report/rej-list.txt ]; then
+              echo "- File dengan hunk GAGAL:"
+              sed 's/^/  - `/; s/$/`/' /tmp/report/rej-list.txt
+            else
+              echo "- Tidak ada hunk gagal: patch tertempel bersih."
+            fi
+            echo "- Hook KSU inline:"
+            sed 's/^/  - `/; s/$/`/' /tmp/report/hooks.txt
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+
+      - name: Upload laporan
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: susfs-probe-419-report
+          path: /tmp/report
+          if-no-files-found: ignore
+          retention-days: 7
