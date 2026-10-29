@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       patch_url:
-        description: "URL RAW file patch SUSFS 4.19 (isi default = patch zhangziren666)"
+        description: "URL RAW file patch SUSFS 4.19"
         default: "https://raw.githubusercontent.com/zhangziren666/bakasu-kernel/main/patches/50_add_susfs_in_kernel-4.19-2.3.0.patch"
       kernel_ref:
         description: "Opsional: branch/tag/hash LENGKAP source kernel (kosong = branch yang dijalankan)"
@@ -31,45 +31,194 @@ jobs:
           set -euo pipefail
           case "$PATCH_URL" in
             https://*) ;;
-            *) echo "::error::patch_url harus berupa URL https RAW (bukan halaman GitHub biasa): '$PATCH_URL'"; exit 1 ;;
+            *) echo "::error::patch_url harus berupa URL https RAW: '$PATCH_URL'"; exit 1 ;;
           esac
           mkdir -p /tmp/report
           curl -fL --retry 3 -o /tmp/susfs.patch "$PATCH_URL"
-          echo "Ukuran : $(wc -c < /tmp/susfs.patch) byte, $(wc -l < /tmp/susfs.patch) baris"
+          cp /tmp/susfs.patch /tmp/report/susfs.patch
           echo "SHA256 : $(sha256sum /tmp/susfs.patch | cut -d' ' -f1)"
-          head -c 300 /tmp/susfs.patch | head -5
+          echo "Ukuran : $(wc -l < /tmp/susfs.patch) baris"
 
-      - name: Uji tempel patch
+      - name: Tempel patch
         run: |
           set +e
           P=/tmp/susfs.patch
-          {
-            echo "### SUSFS probe 4.19"
-            echo "- Source kernel: \`$(git log -1 --format='%h %s')\`"
-            echo "- Versi kernel (Makefile): \`$(sed -n '1,3p' Makefile | tr '\n' ' ')\`"
-            echo "- Patch SHA256: \`$(sha256sum $P | cut -d' ' -f1)\`"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          echo "== File yang disentuh patch =="
-          grep -E '^\+\+\+ ' $P | sed 's|^+++ b/||; s|^+++ ||' | tee /tmp/report/files-touched.txt
-
-          echo "== DRY-RUN (tidak mengubah apa pun) =="
-          patch -p1 --dry-run --no-backup-if-mismatch < $P | tee /tmp/report/dryrun.txt
-          FAILED="$(grep -c 'FAILED' /tmp/report/dryrun.txt)"
-          OK="$(grep -c 'succeeded' /tmp/report/dryrun.txt)"
-          FUZZ="$(grep -c 'with fuzz' /tmp/report/dryrun.txt)"
-          echo "Hunk berhasil: $OK | gagal: $FAILED | pakai fuzz: $FUZZ"
-
-          echo "== PATCH SUNGGUHAN (runner sementara, repo-mu tidak berubah) =="
           patch -p1 --no-backup-if-mismatch < $P | tee /tmp/report/patch.txt
+          grep -c 'FAILED' /tmp/report/patch.txt | sed 's/^/Hunk gagal: /'
+          grep -c 'with fuzz' /tmp/report/patch.txt | sed 's/^/Hunk pakai fuzz: /'
+          find . -name '*.rej' -not -path './.git/*' | sort | tee /tmp/report/rej-before.txt
+          exit 0
 
-          find . -name '*.rej' -not -path './.git/*' | sort | tee /tmp/report/rej-list.txt
-          while read -r f; do echo "-------- $f --------"; cat "$f"; done < /tmp/report/rej-list.txt > /tmp/report/rej-content.txt
-          NREJ="$(grep -c '^@@' /tmp/report/rej-content.txt)"
+      - name: Perbaiki otomatis hunk yang gagal
+        run: |
+          set +e
+          cat > /tmp/fix_susfs.py <<'PYEOF'
+          import re
+          from pathlib import Path
 
-          # Cek 7 hook KSU yang diminta BakaSU (mode inline SUSFS)
+          res = []
+
+
+          def rd(p):
+              return Path(p).read_text()
+
+
+          def wr(p, s):
+              Path(p).write_text(s)
+
+
+          def mark(ok, msg):
+              res.append(("OK     " if ok else "GAGAL  ") + msg)
+
+
+          def fix_makefile():
+              p = "fs/Makefile"
+              s = rd(p)
+              if "susfs.o" in s:
+                  return mark(True, p + " (sudah ada)")
+              if not s.endswith("\n"):
+                  s += "\n"
+              s += "\nobj-$(CONFIG_KSU_SUSFS) += susfs.o\n"
+              wr(p, s)
+              mark(True, p)
+
+
+          def fix_namei():
+              p = "fs/namei.c"
+              s = rd(p)
+              if re.search(r"^int filename_lookup\(", s, re.M):
+                  return mark(True, p + " (sudah non-static)")
+              s2, n = re.subn(r"^static int filename_lookup\(", "int filename_lookup(", s, count=1, flags=re.M)
+              if n == 0:
+                  return mark(False, p + ": filename_lookup tidak ketemu")
+              wr(p, s2)
+              mark(True, p)
+
+
+          def fix_namespace():
+              p = "fs/namespace.c"
+              s = rd(p)
+              if "susfs_alloc_non_unshare_ksu_vfsmnt(name" in s:
+                  return mark(True, p + " (sudah ada)")
+              m = re.search(r"vfs_kern_mount\(struct file_system_type", s)
+              if not m:
+                  return mark(False, p + ": vfs_kern_mount tidak ketemu")
+              a = re.compile(r"^\tmnt = alloc_vfsmnt\(name\);\n", re.M).search(s, m.end())
+              if not a or a.start() - m.end() > 800:
+                  return mark(False, p + ": titik sisip alloc_vfsmnt tidak ketemu")
+              block = (
+                  "#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n"
+                  "\t// - We will just stop checking for ksu process if /sdcard/Android is accessible,\n"
+                  "\t//   for the sake of performance\n"
+                  "\tif (static_branch_unlikely(&susfs_is_sdcard_android_data_not_decrypted)) {\n"
+                  "\t\tif (susfs_is_current_ksu_domain()) {\n"
+                  "\t\t\tstruct mount *sus_mnt = susfs_alloc_non_unshare_ksu_vfsmnt(name ?: \"none\");\n"
+                  "\n"
+                  "\t\t\tif (!sus_mnt)\n"
+                  "\t\t\t\treturn ERR_PTR(-ENOMEM);\n"
+                  "\t\t\treturn &sus_mnt->mnt;\n"
+                  "\t\t}\n"
+                  "\t}\n"
+                  "#endif\n\n"
+              )
+              s = s[:a.start()] + block + s[a.start():]
+              wr(p, s)
+              mark(True, p)
+
+
+          def fix_super():
+              p = "fs/super.c"
+              s = rd(p)
+              if "susfs_def.h" in s:
+                  return mark(True, p + " (sudah ada)")
+              inc = ("#ifdef CONFIG_KSU_SUSFS\n#include <linux/susfs_def.h>\n"
+                     "#include <linux/jump_label.h>\n#endif // #ifdef CONFIG_KSU_SUSFS\n")
+              ext = ("#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n"
+                     "extern bool susfs_is_current_ksu_domain(void);\n"
+                     "extern struct static_key_true susfs_is_sdcard_android_data_not_decrypted;\n"
+                     "#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n")
+              s, n1 = re.subn(r"(#include <linux/user_namespace\.h>\n)", lambda m: m.group(1) + inc, s, count=1)
+              s, n2 = re.subn(r"(static int thaw_super_locked\(struct super_block \*sb\);)",
+                              lambda m: ext + m.group(1), s, count=1)
+              if n1 == 0 or n2 == 0:
+                  return mark(False, p + f": titik sisip tidak ketemu (include={n1}, extern={n2})")
+              wr(p, s)
+              mark(True, p)
+
+
+          def fix_sys():
+              p = "kernel/sys.c"
+              s = rd(p)
+              if "susfs_spoof_uname" in s:
+                  return mark(True, p + " (sudah ada)")
+              m = re.search(r"^SYSCALL_DEFINE1\(newuname,", s, re.M)
+              if not m:
+                  return mark(False, p + ": newuname tidak ketemu")
+              mm = re.compile(r"^\tmemcpy\(&tmp, utsname\(\), sizeof\(tmp\)\);\n", re.M).search(s, m.end())
+              if not mm or mm.start() - m.end() > 400:
+                  return mark(False, p + ": memcpy di newuname tidak ketemu")
+              ext = ("#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME\n#include <linux/jump_label.h>\n"
+                     "extern struct static_key_false susfs_is_uname_spoof_buffer_set;\n"
+                     "extern void susfs_spoof_uname(struct new_utsname *tmp);\n#endif\n")
+              call = ("#ifdef CONFIG_KSU_SUSFS_SPOOF_UNAME\n"
+                      "\tif (static_branch_likely(&susfs_is_uname_spoof_buffer_set))\n"
+                      "\t\tsusfs_spoof_uname(&tmp);\n#endif\n")
+              s = s[:m.start()] + ext + s[m.start():mm.end()] + call + s[mm.end():]
+              wr(p, s)
+              mark(True, p)
+
+
+          def fix_memory():
+              p = "mm/memory.c"
+              s = rd(p)
+              if "susfs_def.h" in s:
+                  return mark(True, p + " (sudah ada)")
+              blk = ("\n#ifdef CONFIG_KSU_SUSFS_SUS_MAP\n#include <linux/susfs_def.h>\n"
+                     "#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MAP\n")
+              s, n = re.subn(r"(#include <asm/pgtable\.h>\n)", lambda m: m.group(1) + blk, s, count=1)
+              if n == 0:
+                  return mark(False, p + ": #include <asm/pgtable.h> tidak ketemu")
+              wr(p, s)
+              mark(True, p)
+
+
+          def check_proc_namespace():
+              p = "fs/proc_namespace.c"
+              s = rd(p)
+              if "show_options2" in s:
+                  mark(True, p + " DIBIARKAN: show_options2 milik Valeryn tetap ada (hunk patch memang salah, sengaja dilewati)")
+              else:
+                  mark(False, p + ": show_options2 HILANG, patch menghapus kode asli Valeryn!")
+
+
+          for fn in (fix_makefile, fix_namei, fix_namespace, fix_super, fix_sys, fix_memory, check_proc_namespace):
+              try:
+                  fn()
+              except Exception as e:
+                  res.append(f"GAGAL  {fn.__name__}: {e}")
+
+          for p in ("fs/susfs.c", "include/linux/susfs.h", "include/linux/susfs_def.h"):
+              mark(Path(p).exists(), p + (" ada" if Path(p).exists() else " TIDAK ADA (file baru dari patch tidak terbentuk)"))
+
+          res.append("DILEWATI fs/notify/fdinfo.c (opsional: penyamaran inotify fdinfo, hunk besar tak cocok)")
+          res.append("DILEWATI fs/proc/task_mmu.c (opsional: penyamaran pagemap SUS_MAP)")
+          print("\n".join(res))
+          Path("/tmp/report/fix-result.txt").write_text("\n".join(res) + "\n")
+          PYEOF
+          python3 /tmp/fix_susfs.py
+          rm -f fs/*.rej fs/*/*.rej kernel/*.rej mm/*.rej security/*/*.rej 2>/dev/null
+          find . -name '*.orig' -not -path './.git/*' -delete 2>/dev/null
+          exit 0
+
+      - name: Laporan
+        run: |
+          set +e
+          git add -A >/dev/null 2>&1
+          git diff --cached --numstat > /tmp/report/numstat.txt
+          git diff --cached > /tmp/report/full-diff.patch
+          echo "== numstat (ditambah / dihapus / file) =="; cat /tmp/report/numstat.txt
+
           echo "== Cek 7 hook KSU inline =="
-          : > /tmp/report/hooks.txt
           for pair in "kernel/sys.c:ksu_handle_setresuid" "fs/exec.c:ksu_handle_execveat" \
                       "fs/open.c:ksu_handle_faccessat" "fs/read_write.c:ksu_handle_sys_read" \
                       "fs/stat.c:ksu_handle_stat" "kernel/reboot.c:ksu_handle_sys_reboot" \
@@ -78,30 +227,34 @@ jobs:
             if grep -q "$s" "$f" 2>/dev/null; then echo "ADA     $f -> $s"; else echo "KOSONG  $f -> $s"; fi
           done | tee /tmp/report/hooks.txt
 
-          # Tanda yang patut dicek manusia: baris tambahan yang menyentuh hal sensitif
-          echo "== Baris tambahan yang patut diperiksa manual =="
-          grep -nE '^\+.*(call_usermodehelper|kernel_write|filp_open\(|commit_creds|override_creds|sock_create|kernel_connect|request_firmware|crypto_)' $P \
-            | head -40 | tee /tmp/report/review-flags.txt
+          echo "== Konteks baris yang ditandai (override_creds / commit_creds) di patch =="
+          : > /tmp/report/review-context.txt
+          grep -nE '^\+.*(override_creds|commit_creds)' /tmp/susfs.patch | cut -d: -f1 | while read -r N; do
+            S=$((N>25 ? N-25 : 1))
+            echo "######## patch baris $N ########" >> /tmp/report/review-context.txt
+            sed -n "${S},$((N+8))p" /tmp/susfs.patch >> /tmp/report/review-context.txt
+          done
+
+          echo "== Baris DIHAPUS oleh patch dari kode asli (cek ada kode Valeryn yang ikut terhapus?) =="
+          awk '/^diff --git/{f=$4} /^-[^-]/{print f": "$0}' /tmp/report/full-diff.patch | head -150 | tee /tmp/report/removed-lines.txt
 
           {
-            echo "- Hunk berhasil: **$OK**, gagal: **$FAILED**, fuzz: **$FUZZ**"
-            echo "- Hunk ditolak (.rej): **$NREJ**"
-            if [ -s /tmp/report/rej-list.txt ]; then
-              echo "- File dengan hunk GAGAL:"
-              sed 's/^/  - `/; s/$/`/' /tmp/report/rej-list.txt
-            else
-              echo "- Tidak ada hunk gagal: patch tertempel bersih."
-            fi
-            echo "- Hook KSU inline:"
-            sed 's/^/  - `/; s/$/`/' /tmp/report/hooks.txt
+            echo "### SUSFS probe 4.19 v2"
+            echo "- Source kernel: \`$(git log -1 --format='%h %s')\`"
+            echo "- Patch SHA256: \`$(sha256sum /tmp/susfs.patch | cut -d' ' -f1)\`"
+            echo ""
+            echo "**Hasil perbaikan otomatis:**"
+            sed 's/^/- /' /tmp/report/fix-result.txt
+            echo ""
+            echo "**Hook KSU inline:**"
+            sed 's/^/- /' /tmp/report/hooks.txt
           } >> "$GITHUB_STEP_SUMMARY"
-          exit 0
 
       - name: Upload laporan
         if: always()
         uses: actions/upload-artifact@v6
         with:
-          name: susfs-probe-419-report
+          name: susfs-probe-419-v2-report
           path: /tmp/report
           if-no-files-found: ignore
           retention-days: 7
