@@ -1,10 +1,5 @@
-name: Build Valeryn + ReSukiSU (opsional SUSFS)
+name: Build Valeryn + BakaSU + SUSFS
 
-# Taruh file ini di: .github/workflows/build-resukisu.yml  (ganti yang lama)
-# (di BRANCH DEFAULT repo fork kamu, supaya tombol "Run workflow" muncul)
-#
-# use_susfs = false (default) -> persis jalur stabil yang sudah teruji (hook manual).
-# use_susfs = true            -> tempel patch SUSFS 4.19 + hook inline. EKSPERIMEN, tes dulu.
 
 on:
   workflow_dispatch:
@@ -16,35 +11,35 @@ on:
         description: "Opsional: cari otomatis commit kernel dengan versi ini, contoh: cip127-st11 atau hanya st11 (angka st dihitung per branch, bandingkan tanggalnya di log)"
         default: ""
       kernel_ref:
-        description: "Opsional: BRANCH/TAG atau hash LENGKAP (40 karakter) SOURCE KERNEL. Jangan isi commit ReSukiSU di sini (itu untuk ksu_ref). Kosong = ujung branch yang dijalankan"
+        description: "Opsional: BRANCH/TAG atau hash LENGKAP (40 karakter) SOURCE KERNEL. Jangan isi commit BakaSU di sini (itu untuk ksu_ref). Kosong = ujung branch yang dijalankan"
         default: ""
       device:
         description: "Codename device"
         default: "lime"
       defconfig:
         description: "Defconfig DASAR, mis. vendor/xxx_defconfig (kosongkan = auto-detect)"
-        default: ""
+        default: "vendor/bengal-perf_defconfig"
       fragments:
         description: "Fragment tambahan dipisah spasi, mis. vendor/lime.config (opsional)"
-        default: ""
+        default: "vendor/xiaomi/lime.config"
       ksu_ref:
-        description: "Branch/tag/commit RESUKISU (bukan kernel). main = terbaru; v4.1.0 = tag stabil. Untuk use_susfs=true pakai v4.2.0-rc3"
+        description: "Branch/tag/commit BAKASU (bukan kernel). d5e9e025 = commit teruji (v4.2.0-rc3-d5e9e025); v4.2.0-rc3 = rilis resmi terbaru; main = paling baru tapi belum teruji; v4.1.0 = lama"
         default: "main"
       update_ksu:
-        description: "Tarik ReSukiSU terbaru dan ganti KSU di source"
+        description: "Tarik BakaSU (sesuai ksu_ref) dan ganti KSU di source"
         type: boolean
         default: true
       apply_hooks:
-        description: "Pasang manual hook ReSukiSU otomatis (aman, dilewati kalau sudah ada). Diabaikan kalau use_susfs=true"
+        description: "Pasang manual hook BakaSU otomatis (aman, dilewati kalau sudah ada). Diabaikan kalau use_susfs=true"
         type: boolean
         default: true
       clang_url:
-        description: "Opsional: URL DOWNLOAD arsip toolchain clang .tar.gz/.tar.xz/.tar.zst (kosong = clang bawaan Ubuntu). Bukan checksum sha256"
-        default: ""
+        description: "toolchain clang"
+        default: "https://github.com/Neebe3289/aosp-clang/releases/download/clang-23.0.1-16464736/clang-23.0.1-16464736.tar.gz"
       use_susfs:
-        description: "EKSPERIMEN: tempel patch SUSFS 4.19 (hook inline, mengganti hook manual). Tes dulu, jangan jadi kernel utama"
+        description: "Pasang SUSFS (patch 4.19 + hook inline, menggantikan hook manual). Matikan untuk build tanpa SUSFS"
         type: boolean
-        default: false
+        default: true
       susfs_patch_url:
         description: "URL RAW patch SUSFS 4.19 (dipakai kalau use_susfs=true)"
         default: "https://raw.githubusercontent.com/zhangziren666/bakasu-kernel/main/patches/50_add_susfs_in_kernel-4.19-2.3.0.patch"
@@ -90,7 +85,7 @@ jobs:
             echo "::error::kernel_repo harus berformat owner/nama atau URL GitHub (diterima: '$IN_REPO')"; exit 1
           fi
           if [[ "$REF" =~ ^[0-9a-fA-F]{7,39}$ ]]; then
-            echo "::error::kernel_ref '$REF' tampak seperti hash PENDEK. Checkout source kernel butuh hash lengkap (40 karakter) atau nama branch/tag. Kalau '$REF' adalah commit ReSukiSU, isi ke input 'ksu_ref', BUKAN 'kernel_ref'."
+            echo "::error::kernel_ref '$REF' tampak seperti hash PENDEK. Checkout source kernel butuh hash lengkap (40 karakter) atau nama branch/tag. Kalau '$REF' adalah commit BakaSU, isi ke input 'ksu_ref', BUKAN 'kernel_ref'."
             exit 1
           fi
           echo "repo=$R" >> "$GITHUB_OUTPUT"
@@ -242,7 +237,7 @@ jobs:
           "$CLANG_BIN/clang" --version | head -1
           echo "$CLANG_BIN" >> "$GITHUB_PATH"
 
-      - name: Update ReSukiSU ke versi terbaru
+      - name: Ambil BakaSU (dulu ReSukiSU) sesuai ksu_ref
         if: ${{ inputs.update_ksu }}
         run: |
           set -euo pipefail
@@ -253,9 +248,9 @@ jobs:
           fi
 
           # clone FULL (tanpa --depth): versi KSU dihitung dari jumlah commit git
-          git clone https://github.com/ReSukiSU/ReSukiSU KernelSU
+          git clone https://github.com/Baka-SU/BakaSU KernelSU
           git -C KernelSU checkout "$KSU_REF"
-          echo "ReSukiSU commit: $(git -C KernelSU rev-parse --short HEAD)"
+          echo "BakaSU commit: $(git -C KernelSU rev-parse --short HEAD)"
 
           ln -sfn ../KernelSU/kernel drivers/kernelsu
 
@@ -293,7 +288,7 @@ jobs:
             exit 1
           fi
           if [ "${KSU_REF}" = "main" ]; then
-            echo "::warning::use_susfs=true tapi ksu_ref=main. Patch ini dibuat untuk BakaSU/ReSukiSU v4.2.0-rc3; versi lebih baru bisa mengubah signature ksu_handle_*. Disarankan ksu_ref=v4.2.0-rc3."
+            echo "::warning::use_susfs=true tapi ksu_ref=main. Patch SUSFS ini diuji pada BakaSU v4.2.0-rc3-d5e9e025; commit yang lebih baru bisa mengubah signature ksu_handle_* atau pengecekan hook. Disarankan ksu_ref=d5e9e025."
           fi
 
       - name: "[SUSFS] Tempel patch + perbaiki hunk yang gagal"
@@ -531,13 +526,13 @@ jobs:
       # =====================================================================
       # JALUR STABIL (hook manual) - tidak dijalankan kalau use_susfs = true
       # =====================================================================
-      - name: Pasang manual hook ReSukiSU (kernel 4.19)
+      - name: Pasang manual hook BakaSU (kernel 4.19, hanya kalau use_susfs=false)
         if: ${{ inputs.apply_hooks && !inputs.use_susfs }}
         run: |
           set -euo pipefail
           cat > /tmp/apply_ksu_hooks.py <<'PYEOF'
           #!/usr/bin/env python3
-          """Pasang ReSukiSU manual hook untuk kernel 4.19 (sesuai resukisu.org/guide/manual-integrate).
+          """Pasang BakaSU manual hook untuk kernel 4.19 (sesuai resukisu.org/guide/manual-integrate).
           Idempotent: file yang sudah punya hook dilewati. Gagal keras kalau pola kode tidak cocok."""
           import re
           import sys
@@ -600,7 +595,7 @@ jobs:
 
 
           def need_api(sym, optional=False):
-              """True = hook ini boleh dipasang. Mengecek apakah ReSukiSU yang dipakai mendefinisikan fungsinya
+              """True = hook ini boleh dipasang. Mengecek apakah BakaSU yang dipakai mendefinisikan fungsinya
               dan jumlah/pointer-level parameternya cocok (ABI sama). Opsional + tidak ada = dilewati."""
               text = ksu_text()
               if not text:
@@ -614,7 +609,7 @@ jobs:
                   if optional:
                       notes.append(f"{sym}: TIDAK ada di KSU ini -> hook opsional dilewati")
                       return False
-                  fails.append(f"KSU yang dipakai tidak mendefinisikan {sym} (hook wajib). Versi ReSukiSU tidak cocok dengan script ini.")
+                  fails.append(f"KSU yang dipakai tidak mendefinisikan {sym} (hook wajib). Versi BakaSU tidak cocok dengan script ini.")
                   return False
               want = [p.count("*") for p in EXPECT[sym]]
               for d in defs:
@@ -901,10 +896,10 @@ jobs:
                                     ("KSU_MANUAL_HOOK_AUTO_INITRC_HOOK", "sys_read/initrc"),
                                     ("KSU_MANUAL_HOOK_AUTO_INPUT_HOOK", "input")):
                       if opt not in kc:
-                          print(f"::warning::ReSukiSU ini tidak punya opsi {opt}: hook {what} TIDAK terpasang otomatis. "
+                          print(f"::warning::BakaSU ini tidak punya opsi {opt}: hook {what} TIDAK terpasang otomatis. "
                                 f"Versi KSU ini mungkin butuh hook manual tambahan; root/fitur terkait bisa tidak berfungsi.")
 
-              print("== API ReSukiSU yang terdeteksi ==")
+              print("== API BakaSU yang terdeteksi ==")
               for n in notes:
                   print("  ", n)
               print("== Hook terpasang ==")
@@ -930,7 +925,7 @@ jobs:
             [ "${n:-0}" = "0" ] && MISSING=$((MISSING+1))
           done
           if [ "$MISSING" -gt 0 ]; then
-            echo "::error::Ada $MISSING file hook wajib yang belum punya hook KSU. ReSukiSU akan gagal compile. Aktifkan input 'apply_hooks' atau pasang manual."
+            echo "::error::Ada $MISSING file hook wajib yang belum punya hook KSU. BakaSU akan gagal compile. Aktifkan input 'apply_hooks' atau pasang manual."
             exit 1
           fi
 
@@ -1007,7 +1002,7 @@ jobs:
           done
           [ -n "$FRAGMENTS" ] && make "${MAKE_ARGS[@]}" olddefconfig
 
-          # ReSukiSU/BakaSU v4.2+ mengecek export simbol static SELinux
+          # BakaSU/BakaSU v4.2+ mengecek export simbol static SELinux
           # (termasuk security_dump_masked_av di services.c). Cara paling aman:
           # selalu nyalakan KALLSYMS_ALL. Di kernel 4.19 KALLSYMS_ALL butuh
           # DEBUG_KERNEL; kalau tidak, olddefconfig membuangnya diam-diam.
@@ -1038,7 +1033,7 @@ jobs:
           echo "Config KALLSYMS/DEBUG_KERNEL yang aktif:"
           grep -E '^(# )?CONFIG_(DEBUG_KERNEL|KALLSYMS|KALLSYMS_ALL)[= ]' out/.config | sed 's/^/  /' || true
           if ! grep -q '^CONFIG_KALLSYMS_ALL=y' out/.config; then
-            echo "::error::CONFIG_KALLSYMS_ALL tidak aktif setelah olddefconfig (kemungkinan dependensi DEBUG_KERNEL/KALLSYMS tidak terpenuhi). ReSukiSU v4.2+ akan gagal di static_export_check."
+            echo "::error::CONFIG_KALLSYMS_ALL tidak aktif setelah olddefconfig (kemungkinan dependensi DEBUG_KERNEL/KALLSYMS tidak terpenuhi). BakaSU v4.2+ akan gagal di static_export_check."
             exit 1
           fi
 
@@ -1049,7 +1044,7 @@ jobs:
             if ! grep -q '^CONFIG_KSU_SUSFS=y' out/.config; then
               echo "::error::CONFIG_KSU_SUSFS tidak aktif setelah olddefconfig. Nilai terkait:"
               grep -E '^(# )?CONFIG_(KSU|THREAD_INFO_IN_TASK|64BIT)[= ]' out/.config || true
-              echo "Kemungkinan: versi ReSukiSU yang dipakai (ksu_ref) tidak punya opsi SUSFS, atau dependensi THREAD_INFO_IN_TASK/64BIT tidak terpenuhi. Pakai ksu_ref=v4.2.0-rc3."
+              echo "Kemungkinan: versi BakaSU yang dipakai (ksu_ref) tidak punya opsi SUSFS, atau dependensi THREAD_INFO_IN_TASK/64BIT tidak terpenuhi. Pakai ksu_ref=v4.2.0-rc3."
               exit 1
             fi
             for o in KSU_SUSFS_SUS_PATH KSU_SUSFS_SUS_MOUNT KSU_SUSFS_SUS_KSTAT KSU_SUSFS_SPOOF_UNAME KSU_SUSFS_OPEN_REDIRECT KSU_SUSFS_SUS_MAP KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS; do
@@ -1062,10 +1057,10 @@ jobs:
           else
             for o in KSU_MANUAL_HOOK_AUTO_SETUID_HOOK KSU_MANUAL_HOOK_AUTO_INITRC_HOOK KSU_MANUAL_HOOK_AUTO_INPUT_HOOK; do
               grep -q "^CONFIG_$o=y" out/.config || \
-                echo "::warning::CONFIG_$o tidak aktif (kemungkinan tidak ada di versi ReSukiSU ini). Hook terkait tidak terpasang otomatis, root bisa tidak lengkap."
+                echo "::warning::CONFIG_$o tidak aktif (kemungkinan tidak ada di versi BakaSU ini). Hook terkait tidak terpasang otomatis, root bisa tidak lengkap."
             done
             if ! grep -q '^CONFIG_KSU_MANUAL_HOOK=y' out/.config; then
-              echo "::error::CONFIG_KSU_MANUAL_HOOK tidak aktif setelah olddefconfig. Cek Kconfig ReSukiSU / fragment kernelsu.config."
+              echo "::error::CONFIG_KSU_MANUAL_HOOK tidak aktif setelah olddefconfig. Cek Kconfig BakaSU / fragment kernelsu.config."
               exit 1
             fi
           fi
@@ -1089,7 +1084,7 @@ jobs:
             echo; echo "== Konteks di sekitar error pertama (akar masalah biasanya di sini) =="
             S=$((N>15 ? N-15 : 1)); sed -n "${S},$((N+10))p" build.log
           fi
-          echo; echo "== Pesan BakaSU/ReSukiSU (static export check) =="
+          echo; echo "== Pesan BakaSU/BakaSU (static export check) =="
           grep -nE "BakaSU|static_export_check|KALLSYMS_ALL|security_dump_masked_av" build.log | head -20 || true
           echo; echo "== Error terkait susfs =="
           grep -nE "susfs|SUSFS" build.log | grep -E "error|undefined" | head -20 || true
@@ -1111,7 +1106,7 @@ jobs:
           echo "2. Baris compile KSU di build.log         : $NCOMP"
           echo "3. String 'KernelSU' di dalam Image       : $NSTR"
           echo "4. String versi di Image                  : ${VER:-(tidak terdeteksi)}"
-          echo "5. Commit ReSukiSU yang di-clone          : ${KSU_COMMIT:-(tidak ada)}"
+          echo "5. Commit BakaSU yang di-clone          : ${KSU_COMMIT:-(tidak ada)}"
           echo "   Versi kernel (kernel.release)         : $(cat out/include/config/kernel.release 2>/dev/null)"
           echo "   Commit source kernel                  : $(git log -1 --format='%h %ad %s' --date=short 2>/dev/null)"
           echo "   String 'susfs' di Image               : $NSUSFS"
@@ -1123,7 +1118,7 @@ jobs:
             echo "- Objek KSU ter-compile: \`$OBJ\` file"
             echo "- String KernelSU di Image: \`$NSTR\`"
             echo "- Versi di Image: \`${VER:-tidak terdeteksi}\`"
-            echo "- Commit ReSukiSU: \`${KSU_COMMIT:-tidak ada}\`"
+            echo "- Commit BakaSU: \`${KSU_COMMIT:-tidak ada}\`"
             echo "- Mode SUSFS: \`${USE_SUSFS}\` (string susfs di Image: $NSUSFS)"
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -1152,7 +1147,7 @@ jobs:
           ### AnyKernel setup
           # global properties
           properties() { '
-          kernel.string=Imperial Valeryn + ReSukiSU (custom build)
+          kernel.string=Imperial Valeryn + BakaSU (custom build)
           do.devicecheck=1
           do.modules=0
           do.systemless=1
@@ -1202,8 +1197,8 @@ jobs:
 
           KSU_SHORT="$(git -C KernelSU rev-parse --short HEAD 2>/dev/null || echo unknown)"
           KERN_SHORT="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
-          TAG=""; [ "$USE_SUSFS" = "true" ] && TAG="-SUSFS-EXPERIMENT"
-          ZIP="Valeryn-${DEVICE}-ReSukiSU-${KSU_SHORT}${TAG}-k${KERN_SHORT}-$(date +%Y%m%d).zip"
+          TAG=""; [ "$USE_SUSFS" = "true" ] && TAG="-SUSFS"
+          ZIP="Valeryn-${DEVICE}-BakaSU-${KSU_SHORT}${TAG}-k${KERN_SHORT}-$(date +%Y%m%d).zip"
           ( cd AnyKernel3 && zip -r9 "../$ZIP" . -x '.git*' )
           echo "ZIP_NAME=$ZIP" >> "$GITHUB_ENV"
           ls -lh "$ZIP"
