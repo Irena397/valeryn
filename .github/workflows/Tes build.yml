@@ -299,8 +299,12 @@ jobs:
       - name: "[SUSFS] Tempel patch + perbaiki hunk yang gagal"
         if: ${{ inputs.use_susfs }}
         run: |
-          set -uo pipefail
+          set -u
+          # GitHub menjalankan bash dengan -e. `patch` sengaja keluar dengan kode 1 kalau ada
+          # hunk gagal (kita memang mengharapkan 9, lalu memperbaikinya), jadi -e dimatikan dulu.
+          set +e
           patch -p1 --no-backup-if-mismatch < /tmp/susfs.patch | tee /tmp/susfs_patch.log
+          set -e
           echo "Hunk gagal: $(grep -c 'FAILED' /tmp/susfs_patch.log || true) | fuzz: $(grep -c 'with fuzz' /tmp/susfs_patch.log || true)"
 
           # hanya 9 file .rej ini yang kita kenal dan sudah kita analisis
