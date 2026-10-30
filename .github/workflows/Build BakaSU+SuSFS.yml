@@ -34,7 +34,7 @@ on:
         type: boolean
         default: true
       clang_url:
-        description: "toolchain clang"
+        description: "Opsional: URL DOWNLOAD arsip toolchain clang .tar.gz/.tar.xz/.tar.zst (kosong = clang bawaan Ubuntu). Bukan checksum sha256"
         default: "https://github.com/Neebe3289/aosp-clang/releases/download/clang-23.0.1-16464736/clang-23.0.1-16464736.tar.gz"
       use_susfs:
         description: "Pasang SUSFS (patch 4.19 + hook inline, menggantikan hook manual). Matikan untuk build tanpa SUSFS"
@@ -464,6 +464,36 @@ jobs:
               mark(True, p)
 
 
+          def fix_cmdline():
+              # Patch SUSFS ini mendefinisikan susfs_spoof_cmdline_or_bootconfig() tapi TIDAK
+              # memasangnya di fs/proc/cmdline.c, jadi penyamaran /proc/cmdline tidak pernah aktif.
+              # Hook di bawah hanya jalan setelah ReSuSFS/ksu_susfs mengisi cmdline palsu.
+              p = "fs/proc/cmdline.c"
+              if not Path(p).exists():
+                  return mark(False, p + ": file tidak ada (penyamaran cmdline tidak aktif)")
+              s = rd(p)
+              if "susfs_spoof_cmdline_or_bootconfig" in s:
+                  return mark(True, p + " (sudah ada)")
+              m = re.search(r"^static int cmdline_proc_show\(struct seq_file \*m, void \*v\)\n\{\n", s, re.M)
+              if not m:
+                  return mark(False, p + ": cmdline_proc_show tidak ketemu (bentuk berbeda; penyamaran cmdline tidak aktif)")
+              ext = ("#ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG\n"
+                     "#include <linux/jump_label.h>\n"
+                     "extern struct static_key_false susfs_is_fake_cmdline_or_bootconfig_buffer_set;\n"
+                     "extern void susfs_spoof_cmdline_or_bootconfig(struct seq_file *m);\n"
+                     "#endif\n")
+              call = ("#ifdef CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG\n"
+                      "\tif (static_branch_unlikely(&susfs_is_fake_cmdline_or_bootconfig_buffer_set)) {\n"
+                      "\t\tsusfs_spoof_cmdline_or_bootconfig(m);\n"
+                      "\t\tseq_putc(m, '\\n');\n"
+                      "\t\treturn 0;\n"
+                      "\t}\n"
+                      "#endif\n")
+              s = s[:m.start()] + ext + s[m.start():m.end()] + call + s[m.end():]
+              wr(p, s)
+              mark(True, p + " (hook penyamaran cmdline dipasang)")
+
+
           def fix_proc_namespace():
               # Patch menghapus cabang show_options2 milik Valeryn di beberapa fungsi.
               # Kembalikan supaya opsi mount filesystem (mis. sdcardfs) tetap tampil seperti aslinya.
@@ -486,7 +516,7 @@ jobs:
               mark(total > 0, p + f": cabang show_options2 dikembalikan di {total} tempat")
 
 
-          for fn in (fix_makefile, fix_namei, fix_namespace, fix_super, fix_sys, fix_memory, fix_proc_namespace):
+          for fn in (fix_makefile, fix_namei, fix_namespace, fix_super, fix_sys, fix_memory, fix_proc_namespace, fix_cmdline):
               try:
                   fn()
               except Exception as e:
