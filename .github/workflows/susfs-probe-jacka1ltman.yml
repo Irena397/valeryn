@@ -1,0 +1,136 @@
+name: SUSFS probe - kandidat JackA1ltman (cek saja, TANPA build, TANPA auto-fix)
+
+# Taruh di: .github/workflows/susfs-probe-jacka1ltman.yml
+# Workflow ini TIDAK membangun kernel, TIDAK mengubah repo kamu, dan TIDAK
+# menambal otomatis (berbeda dari susfs-probe-419-v2.yml yang fixer-nya
+# dibuat khusus untuk patch zhangziren666). Ini kandidat sumber BARU
+# (JackA1ltman/NonGKI_Kernel_Build_2nd), jadi kita cuma menguji dulu:
+# versi SUSFS-nya, hunk mana yang gagal ditempel ke source Valeryn, dan
+# apakah dua simbol yang bikin BakaSU main gagal compile (CMD_SUSFS_SET_
+# PRIORITY_UID_FILTER / CMD_SUSFS_SET_SUS_PATH_UID_FILTER) sudah tersedia.
+
+on:
+  workflow_dispatch:
+    inputs:
+      patch_url:
+        description: "URL RAW patch SUSFS 4.19 kandidat (default: JackA1ltman, branch mainline)"
+        default: "https://raw.githubusercontent.com/JackA1ltman/NonGKI_Kernel_Build_2nd/mainline/Patches/Patch/susfs_patch_to_4.19.patch"
+      kernel_ref:
+        description: "Opsional: branch/tag/hash LENGKAP source kernel (kosong = branch yang dijalankan)"
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout kernel source
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.kernel_ref }}
+          fetch-depth: 1
+
+      - name: Unduh patch kandidat
+        env:
+          PATCH_URL: ${{ inputs.patch_url }}
+        run: |
+          set -euo pipefail
+          case "$PATCH_URL" in
+            https://*) ;;
+            *) echo "::error::patch_url harus URL https RAW: '$PATCH_URL'"; exit 1 ;;
+          esac
+          mkdir -p /tmp/report
+          curl -fL --retry 3 -o /tmp/susfs.patch "$PATCH_URL"
+          cp /tmp/susfs.patch /tmp/report/susfs.patch
+          echo "SHA256 : $(sha256sum /tmp/susfs.patch | cut -d' ' -f1)"
+          echo "Ukuran : $(wc -l < /tmp/susfs.patch) baris"
+
+          echo "== Versi SUSFS yang tertulis di patch (cari #define SUSFS_VERSION) =="
+          grep -n "SUSFS_VERSION" /tmp/susfs.patch | head -5 | tee /tmp/report/version.txt || echo "(tidak ketemu)" | tee /tmp/report/version.txt
+
+          echo "== Apakah dua simbol pemicu error BakaSU main sudah ada di patch ini? =="
+          for sym in CMD_SUSFS_SET_PRIORITY_UID_FILTER CMD_SUSFS_SET_SUS_PATH_UID_FILTER; do
+            n="$(grep -c "$sym" /tmp/susfs.patch || true)"
+            echo "  $sym: $n kemunculan"
+          done | tee /tmp/report/symbol-check.txt
+
+      - name: Dry-run tempel (tidak mengubah apa pun)
+        run: |
+          set +e
+          P=/tmp/susfs.patch
+          echo "== File yang disentuh patch =="
+          grep -E '^\+\+\+ ' $P | sed 's|^+++ b/||; s|^+++ ||' | tee /tmp/report/files-touched.txt
+
+          echo "== DRY-RUN =="
+          patch -p1 --dry-run --no-backup-if-mismatch < $P | tee /tmp/report/dryrun.txt
+          FAILED="$(grep -c 'FAILED' /tmp/report/dryrun.txt)"
+          OK="$(grep -c 'succeeded' /tmp/report/dryrun.txt)"
+          FUZZ="$(grep -c 'with fuzz' /tmp/report/dryrun.txt)"
+          echo "Hunk berhasil: $OK | gagal: $FAILED | pakai fuzz: $FUZZ"
+          exit 0
+
+      - name: Tempel sungguhan (runner sementara, repo-mu tidak berubah) + lihat hasil nyata
+        run: |
+          set +e
+          P=/tmp/susfs.patch
+          patch -p1 --no-backup-if-mismatch < $P | tee /tmp/report/patch.txt
+
+          find . -name '*.rej' -not -path './.git/*' | sort | tee /tmp/report/rej-list.txt
+          while read -r f; do echo "-------- $f --------"; cat "$f"; done < /tmp/report/rej-list.txt > /tmp/report/rej-content.txt
+
+          echo "== Versi SUSFS di include/linux/susfs.h hasil tempel (kalau ada) =="
+          grep -rn "SUSFS_VERSION" include/linux/susfs*.h fs/susfs.c 2>/dev/null | tee -a /tmp/report/version.txt || true
+
+          echo "== Apakah dua simbol itu SEKARANG terdefinisi di source (setelah patch) =="
+          for sym in CMD_SUSFS_SET_PRIORITY_UID_FILTER CMD_SUSFS_SET_SUS_PATH_UID_FILTER; do
+            if grep -rqn "$sym" include/ fs/ 2>/dev/null; then
+              echo "  ADA     $sym"
+            else
+              echo "  TIDAK ADA  $sym"
+            fi
+          done | tee /tmp/report/symbol-after-patch.txt
+
+          echo "== Cek 7 hook KSU inline (yang biasanya diminta BakaSU) =="
+          for pair in "kernel/sys.c:ksu_handle_setresuid" "fs/exec.c:ksu_handle_execveat" \
+                      "fs/open.c:ksu_handle_faccessat" "fs/read_write.c:ksu_handle_sys_read" \
+                      "fs/stat.c:ksu_handle_stat" "kernel/reboot.c:ksu_handle_sys_reboot" \
+                      "drivers/input/input.c:ksu_handle_input_handle_event"; do
+            f="${pair%%:*}"; s="${pair##*:}"
+            if grep -q "$s" "$f" 2>/dev/null; then echo "  ADA     $f -> $s"; else echo "  KOSONG  $f -> $s"; fi
+          done | tee /tmp/report/hooks.txt
+
+          {
+            echo "### SUSFS probe - kandidat JackA1ltman"
+            echo "- Source kernel: \`$(git log -1 --format='%h %s')\`"
+            echo "- Patch SHA256: \`$(sha256sum $P | cut -d' ' -f1)\`"
+            echo ""
+            echo "**Versi SUSFS:**"; sed 's/^/  /' /tmp/report/version.txt
+            echo ""
+            echo "**Simbol pemicu error BakaSU main (sebelum patch, di dalam file patch itu sendiri):**"
+            sed 's/^/  /' /tmp/report/symbol-check.txt
+            echo ""
+            echo "**Simbol tsb setelah patch ditempel ke source:**"
+            sed 's/^/  /' /tmp/report/symbol-after-patch.txt
+            echo ""
+            if [ -s /tmp/report/rej-list.txt ]; then
+              echo "**Hunk GAGAL ditempel:**"
+              sed 's/^/  - `/; s/$/`/' /tmp/report/rej-list.txt
+            else
+              echo "**Tidak ada hunk gagal: patch tertempel bersih.**"
+            fi
+            echo ""
+            echo "**Hook KSU inline:**"; sed 's/^/  /' /tmp/report/hooks.txt
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+
+      - name: Upload laporan
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: susfs-probe-jacka1ltman-report
+          path: /tmp/report
+          if-no-files-found: ignore
+          retention-days: 7
